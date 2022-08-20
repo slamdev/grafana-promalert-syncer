@@ -92,6 +92,12 @@ func main() {
 	})
 
 	for namespace, groupsByName := range groupsByNamespace {
+		if _, err := gclient.NewFolder(namespace, namespace); err != nil {
+			if !strings.Contains(err.Error(), "the folder has been changed by someone else") {
+				klog.ErrorS(err, "failed to create new folder", "folder", namespace)
+				continue
+			}
+		}
 		groups := maps.Values(groupsByName)
 		for _, group := range groups {
 			ruleGroup, err := convertGroup(group, namespace)
@@ -99,31 +105,48 @@ func main() {
 				klog.ErrorS(err, "failed to convert [%s]:[%s] group to grafana representation", namespace, group.Name)
 				continue
 			}
+			alertRules := ruleGroup.Rules
+			ruleGroup.Rules = nil
+
 			if err := gclient.SetAlertRuleGroup(ruleGroup); err != nil {
 				klog.ErrorS(err, "failed to update rule group in gapi", "group", ruleGroup)
 				continue
 			}
+			for _, rule := range alertRules {
+				if _, err := gclient.NewAlertRule(&rule); err != nil {
+					klog.ErrorS(err, "failed to create rule in gapi", "rule", rule.UID)
+					continue
+				}
+			}
 		}
-		klog.Infof("[%d] groups are synced to grafana", len(groups))
+		klog.Infof("[%d] groups are synced to grafana in [%s] namespace", len(groups), namespace)
 	}
 }
 
 func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup, error) {
-	rules := make([]gapi.AlertRule, len(group.Rules))
-	for i, rule := range group.Rules {
-		if _, ok := rule.Annotations["description"]; !ok {
+	rules := map[string]gapi.AlertRule{}
+	for _, rule := range group.Rules {
+		if !hasKey(rule.Annotations, "description") {
 			rule.Annotations["description"] = rule.Annotations["message"]
 			delete(rule.Annotations, "message")
 		}
+
+		// Alerts in grafana should have uniq names but prometheus doesn't have this limitation
+		// so if we find an existing alert with the same name we add D suffix to the duplicate one
+		for hasKey(rules, rule.Alert) {
+			rule.Alert = rule.Alert + "D"
+		}
+
 		uid := strings.ToLower(fmt.Sprintf("%s-%s-%s", namespace, group.Name, rule.Alert))
 		if len(uid) > 40 {
 			h := hash(uid)
 			uid = fmt.Sprintf("%s-%s", uid[0:40-len(h)-1], h)
+			uid = strings.ReplaceAll(uid, "--", "-")
 		}
 
-		rules[i] = gapi.AlertRule{
+		rules[rule.Alert] = gapi.AlertRule{
 			UID:         uid,
-			Title:       strings.ToLower(fmt.Sprintf("%s: %s", group.Name, rule.Alert)),
+			Title:       fmt.Sprintf("%s: %s", group.Name, rule.Alert),
 			Annotations: rule.Annotations,
 			Condition:   "B",
 			OrgID:       1,
@@ -156,15 +179,20 @@ func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup,
 			For:          rule.For,
 		}
 	}
-	interval, err := model.ParseDuration(group.Interval)
-	if err != nil {
-		return gapi.RuleGroup{}, fmt.Errorf("failed to parse duration [%s] in [%s]:[%s] group", group.Interval, namespace, group.Name)
+
+	interval := 1 * time.Minute
+	if group.Interval != "" {
+		promInterval, err := model.ParseDuration(group.Interval)
+		if err != nil {
+			return gapi.RuleGroup{}, fmt.Errorf("failed to parse duration [%s] in [%s]:[%s] group", group.Interval, namespace, group.Name)
+		}
+		interval = time.Duration(promInterval)
 	}
 	return gapi.RuleGroup{
 		FolderUID: namespace,
 		Title:     group.Name,
-		Interval:  int64(int(time.Duration(interval).Seconds())),
-		Rules:     rules,
+		Interval:  int64(interval.Seconds()),
+		Rules:     maps.Values(rules),
 	}, nil
 }
 
@@ -181,6 +209,11 @@ func filterRules(rules []monitoring.Rule) []monitoring.Rule {
 
 func hash(text string) string {
 	algorithm := fnv.New32a()
-	algorithm.Write([]byte(text))
+	_, _ = algorithm.Write([]byte(text))
 	return strconv.FormatUint(uint64(algorithm.Sum32()), 10)
+}
+
+func hasKey[M ~map[K]V, K comparable, V any](m M, k K) bool {
+	_, ok := m[k]
+	return ok
 }
