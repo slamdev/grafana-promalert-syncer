@@ -86,10 +86,7 @@ func main() {
 		}
 	}
 
-	gclient, _ := gapi.New(grafanaUrl, gapi.Config{
-		APIKey:     grafanaAPIKey,
-		NumRetries: 3,
-	})
+	gclient, _ := gapi.New(grafanaUrl, gapi.Config{APIKey: grafanaAPIKey})
 
 	for namespace, groupsByName := range groupsByNamespace {
 		if _, err := gclient.NewFolder(namespace, namespace); err != nil {
@@ -102,20 +99,41 @@ func main() {
 		for _, group := range groups {
 			ruleGroup, err := convertGroup(group, namespace)
 			if err != nil {
-				klog.ErrorS(err, "failed to convert [%s]:[%s] group to grafana representation", namespace, group.Name)
+				klog.ErrorS(err, "failed to convert group to grafana representation", "namespace", namespace, "group", group.Name)
 				continue
 			}
 			alertRules := ruleGroup.Rules
 			ruleGroup.Rules = nil
 
-			if err := gclient.SetAlertRuleGroup(ruleGroup); err != nil {
-				klog.ErrorS(err, "failed to update rule group in gapi", "group", ruleGroup)
-				continue
+			//if err := gclient.SetAlertRuleGroup(ruleGroup); err != nil {
+			//	klog.ErrorS(err, "failed to update rule group in gapi", "group", ruleGroup)
+			//	continue
+			//}
+
+			existingRules := map[string]struct{}{}
+
+			existingRuleGroup, err := gclient.AlertRuleGroup(ruleGroup.FolderUID, ruleGroup.Title)
+			if err != nil {
+				klog.ErrorS(err, "failed to fetch rule group", "folder", ruleGroup.FolderUID, "group", ruleGroup.Title)
+			} else {
+				for _, rule := range existingRuleGroup.Rules {
+					existingRules[rule.UID] = struct{}{}
+				}
 			}
+
 			for _, rule := range alertRules {
-				if _, err := gclient.NewAlertRule(&rule); err != nil {
-					klog.ErrorS(err, "failed to create rule in gapi", "rule", rule.UID)
-					continue
+				if hasKey(existingRules, rule.UID) {
+					klog.InfoS("updating rule", "rule", rule.UID)
+					if err := gclient.UpdateAlertRule(&rule); err != nil {
+						klog.ErrorS(err, "failed to update rule in gapi", "rule", rule.UID)
+						continue
+					}
+				} else {
+					klog.InfoS("creating rule", "rule", rule.UID)
+					if _, err := gclient.NewAlertRule(&rule); err != nil {
+						klog.ErrorS(err, "failed to create rule in gapi", "rule", rule.UID)
+						continue
+					}
 				}
 			}
 		}
@@ -126,10 +144,8 @@ func main() {
 func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup, error) {
 	rules := map[string]gapi.AlertRule{}
 	for _, rule := range group.Rules {
-		if !hasKey(rule.Annotations, "description") {
-			rule.Annotations["description"] = rule.Annotations["message"]
-			delete(rule.Annotations, "message")
-		}
+
+		annotations := reconcileAnnotations(rule.Annotations)
 
 		// Alerts in grafana should have uniq names but prometheus doesn't have this limitation
 		// so if we find an existing alert with the same name we add D suffix to the duplicate one
@@ -147,7 +163,7 @@ func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup,
 		rules[rule.Alert] = gapi.AlertRule{
 			UID:         uid,
 			Title:       fmt.Sprintf("%s: %s", group.Name, rule.Alert),
-			Annotations: rule.Annotations,
+			Annotations: annotations,
 			Condition:   "B",
 			OrgID:       1,
 			FolderUID:   namespace,
@@ -156,7 +172,7 @@ func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup,
 				{
 					RefID: "A",
 					RelativeTimeRange: gapi.RelativeTimeRange{
-						From: 3600,
+						From: 600,
 					},
 					DatasourceUID: "prometheus",
 					Model: map[string]interface{}{
@@ -194,6 +210,25 @@ func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup,
 		Interval:  int64(interval.Seconds()),
 		Rules:     maps.Values(rules),
 	}, nil
+}
+
+func reconcileAnnotations(current map[string]string) map[string]string {
+	annotations := current
+
+	if !hasKey(annotations, "description") && hasKey(annotations, "message") {
+		annotations["description"] = annotations["message"]
+		delete(annotations, "message")
+	}
+
+	for name, value := range annotations {
+		if strings.Contains(value, "$value") {
+			annotations[name] = strings.ReplaceAll(value, "$value", "(or $values.B.Value 0.0)")
+		}
+		if strings.Contains(value, "| first | value") {
+			annotations[name] = strings.ReplaceAll(value, "| first | value", "")
+		}
+	}
+	return annotations
 }
 
 func filterRules(rules []monitoring.Rule) []monitoring.Rule {
