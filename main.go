@@ -22,6 +22,10 @@ func main() {
 	flag.StringVar(&grafanaUrl, "grafana-url", "", "Url to grafana service")
 	var grafanaAPIKey string
 	flag.StringVar(&grafanaAPIKey, "grafana-api-key", "", "Grafana API Key")
+	var noDataState string
+	flag.StringVar(&noDataState, "nodata-state", "OK", "No data state: OK|NoData|Alerting")
+	var execErrState string
+	flag.StringVar(&execErrState, "exec-err-state", "OK", "Exec error state: OK|Error|Alerting")
 
 	flag.Parse()
 
@@ -97,7 +101,7 @@ func main() {
 		}
 		groups := maps.Values(groupsByName)
 		for _, group := range groups {
-			ruleGroup, err := convertGroup(group, namespace)
+			ruleGroup, err := convertGroup(group, namespace, noDataState, execErrState)
 			if err != nil {
 				klog.ErrorS(err, "failed to convert group to grafana representation", "namespace", namespace, "group", group.Name)
 				continue
@@ -141,7 +145,7 @@ func main() {
 	}
 }
 
-func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup, error) {
+func convertGroup(group monitoring.RuleGroup, namespace string, noDataState string, execErrState string) (gapi.RuleGroup, error) {
 	rules := map[string]gapi.AlertRule{}
 	for _, rule := range group.Rules {
 
@@ -189,8 +193,8 @@ func convertGroup(group monitoring.RuleGroup, namespace string) (gapi.RuleGroup,
 					},
 				},
 			},
-			NoDataState:  gapi.NoDataOk,
-			ExecErrState: gapi.ErrError,
+			NoDataState:  gapi.NoDataState(noDataState),
+			ExecErrState: gapi.ExecErrState(execErrState),
 			Labels:       rule.Labels,
 			For:          rule.For,
 		}
